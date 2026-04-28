@@ -1,10 +1,17 @@
 import sys
 import io
+import re
+import threading
+import concurrent.futures
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import List, Optional
+
 import typer
-from typing import Optional
 from rich.console import Console
 from rich.table import Table
 from rich import box
+from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn, TextColumn
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
@@ -12,10 +19,11 @@ console = Console()
 PRICE_COLORS = {"low": "green", "typical": "yellow", "high": "red"}
 
 
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+
 def _parse_price(price_str: str) -> Optional[float]:
     if not price_str:
         return None
-    import re
     m = re.search(r"[\d,]+(?:\.\d+)?", price_str.replace(",", ""))
     try:
         return float(m.group()) if m else None
@@ -55,13 +63,13 @@ def _dedupe(flights) -> list:
     return out
 
 
-def _search_one_way(frm, to, date, seat, passengers):
+def _search_one_way(frm, to, date_str, seat, passengers):
     from fast_flights import FlightData
     from fast_flights.filter import TFSData
     from fast_flights.core import get_flights_from_filter
 
     tfs = TFSData.from_interface(
-        flight_data=[FlightData(date=date, from_airport=frm, to_airport=to)],
+        flight_data=[FlightData(date=date_str, from_airport=frm, to_airport=to)],
         trip="one-way",
         passengers=passengers,
         seat=seat,
@@ -86,9 +94,16 @@ def _search_one_way(frm, to, date, seat, passengers):
     return result
 
 
-def _print_results(result, frm, to, date, seat, pax, max_stops, max_price, limit):
-    flights = _dedupe(result.flights or [])
+def _parse_date_arg(d: str, label: str) -> str:
+    try:
+        return datetime.strptime(d, "%d-%m-%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        console.print(f"[red]Invalid {label}: {d!r} — expected DD-MM-YYYY (e.g. 30-04-2026)[/red]")
+        raise typer.Exit(1)
 
+
+def _print_results(result, frm, to, date_str, seat, pax, max_stops, max_price, limit):
+    flights = _dedupe(result.flights or [])
     if not flights:
         console.print("[yellow]No flights found for this route/date.[/yellow]")
         return
@@ -107,9 +122,7 @@ def _print_results(result, frm, to, date, seat, pax, max_stops, max_price, limit
     displayed = flights[:limit]
     remaining = len(flights) - limit
 
-    # Convert internal YYYY-MM-DD back to DD-MM-YYYY for display
-    from datetime import datetime
-    display_date = datetime.strptime(date, "%Y-%m-%d").strftime("%d-%m-%Y")
+    display_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%m-%Y")
 
     table = Table(
         title=(
@@ -138,6 +151,179 @@ def _print_results(result, frm, to, date, seat, pax, max_stops, max_price, limit
     console.print()
 
 
+# ── Weekend search helpers ─────────────────────────────────────────────────────
+
+def _easter(year: int) -> date:
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = (h + l - 7 * m + 114) % 31 + 1
+    return date(year, month, day)
+
+
+def _brazilian_holidays(year: int) -> dict:
+    easter = _easter(year)
+    carnival = easter - timedelta(days=47)
+    corpus = easter + timedelta(days=60)
+    return {
+        date(year, 1, 1): "New Year's Day",
+        carnival - timedelta(1): "Carnival Monday",
+        carnival: "Carnival Tuesday",
+        easter - timedelta(2): "Good Friday",
+        date(year, 4, 21): "Tiradentes",
+        date(year, 5, 1): "Labor Day",
+        corpus: "Corpus Christi",
+        date(year, 9, 7): "Independence Day",
+        date(year, 10, 12): "Nossa Senhora Aparecida",
+        date(year, 11, 2): "All Souls' Day",
+        date(year, 11, 15): "Republic Day",
+        date(year, 11, 20): "Black Consciousness Day",
+        date(year, 12, 25): "Christmas",
+    }
+
+
+@dataclass
+class DateWindow:
+    d: date
+    min_hour: int
+    max_hour: int
+    desc: str
+
+
+@dataclass
+class WeekendWindow:
+    outbound_windows: List[DateWindow]
+    inbound_windows: List[DateWindow]
+    is_long: bool = False
+    holiday_name: Optional[str] = None
+
+    def date_range(self) -> str:
+        start = min(dw.d for dw in self.outbound_windows)
+        end = max(dw.d for dw in self.inbound_windows)
+        if start.month == end.month:
+            return f"{start.strftime('%b %-d')}–{end.strftime('%-d')}"
+        return f"{start.strftime('%b %-d')} – {end.strftime('%b %-d')}"
+
+    def label(self) -> str:
+        prefix = "★ " if self.is_long else "  "
+        s = f"{prefix}{self.date_range()}"
+        if self.holiday_name:
+            s += f"\n  ({self.holiday_name})"
+        return s
+
+
+@dataclass
+class BestFlight:
+    d: date
+    departure: str
+    airline: str
+    price_str: str
+    price_num: float
+
+    def display(self) -> str:
+        m = re.match(r"(\d+:\d+)\s*([AP]M)", self.departure)
+        time_str = f"{m.group(1)}{m.group(2)}" if m else "?"
+        day = self.d.strftime("%a %-d %b")
+        return f"{day}  {time_str}\n{self.airline}  {self.price_str}"
+
+
+@dataclass
+class WeekendResult:
+    window: WeekendWindow
+    best_out: Optional[BestFlight] = None
+    best_in: Optional[BestFlight] = None
+
+    @property
+    def total(self) -> Optional[float]:
+        if self.best_out and self.best_in:
+            return self.best_out.price_num + self.best_in.price_num
+        return None
+
+
+def _generate_weekend_windows(start: date, end: date, holidays: dict) -> List[WeekendWindow]:
+    windows = []
+    # Advance to first Friday
+    days_to_fri = (4 - start.weekday()) % 7 or 7
+    d = start + timedelta(days=days_to_fri)
+
+    while d <= end:
+        fri, sat, sun, mon = d, d + timedelta(1), d + timedelta(2), d + timedelta(3)
+        thu, tue = fri - timedelta(1), mon + timedelta(1)
+
+        is_long = False
+        holiday_name = None
+        outbound: List[DateWindow] = []
+        inbound: List[DateWindow] = []
+
+        # Friday holiday → can fly Thu evening or all-day Friday
+        if fri in holidays:
+            is_long = True
+            holiday_name = holidays[fri]
+            outbound.append(DateWindow(thu, 17, 23, "Thu evening"))
+            outbound.append(DateWindow(fri, 0, 23, f"Fri ({holiday_name})"))
+
+        # Standard outbound
+        outbound.append(DateWindow(fri, 17, 23, "Fri evening"))
+        outbound.append(DateWindow(sat, 0, 10, "Sat morning"))
+
+        # Standard inbound
+        inbound.append(DateWindow(sun, 12, 23, "Sun afternoon"))
+        inbound.append(DateWindow(mon, 0, 7, "Mon early"))
+
+        # Monday holiday → can return all-day Monday or Tue early
+        if mon in holidays:
+            is_long = True
+            holiday_name = holiday_name or holidays[mon]
+            inbound.append(DateWindow(mon, 0, 23, f"Mon ({holidays[mon]})"))
+            inbound.append(DateWindow(tue, 0, 7, "Tue early"))
+
+        windows.append(WeekendWindow(
+            outbound_windows=outbound,
+            inbound_windows=inbound,
+            is_long=is_long,
+            holiday_name=holiday_name,
+        ))
+        d += timedelta(7)
+
+    return windows
+
+
+def _parse_flight_hour(departure_str: str) -> Optional[int]:
+    m = re.match(r"(\d+):(\d+)\s*(AM|PM)", departure_str.strip())
+    if not m:
+        return None
+    h, ampm = int(m.group(1)), m.group(3)
+    if ampm == "PM" and h != 12:
+        h += 12
+    elif ampm == "AM" and h == 12:
+        h = 0
+    return h
+
+
+def _find_best_in_window(flights, dw: DateWindow) -> Optional[BestFlight]:
+    best: Optional[BestFlight] = None
+    for f in flights:
+        hour = _parse_flight_hour(f.departure)
+        if hour is None or not (dw.min_hour <= hour <= dw.max_hour):
+            continue
+        price = _parse_price(f.price)
+        if price is None:
+            continue
+        if best is None or price < best.price_num:
+            best = BestFlight(d=dw.d, departure=f.departure, airline=f.name,
+                              price_str=f.price, price_num=price)
+    return best
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
 @app.command()
 def search(
     origin: str = typer.Argument(..., help="Origin airport IATA code (e.g. GRU)"),
@@ -151,23 +337,14 @@ def search(
     max_price: Optional[float] = typer.Option(None, "--max-price", "-p", help="Filter: maximum price (numeric, in displayed currency)"),
     limit: int = typer.Option(20, "--limit", "-n", help="Max rows to display"),
 ):
-    """Search for flights and display prices."""
+    """Search for flights on a specific date."""
     from fast_flights import Passengers
-    from datetime import datetime
 
     origin = origin.upper()
     destination = destination.upper()
-
-    def _parse_date(d: str, label: str) -> str:
-        try:
-            return datetime.strptime(d, "%d-%m-%Y").strftime("%Y-%m-%d")
-        except ValueError:
-            console.print(f"[red]Invalid {label}: {d!r} — expected DD-MM-YYYY (e.g. 30-04-2026)[/red]")
-            raise typer.Exit(1)
-
-    date = _parse_date(date, "date")
+    date = _parse_date_arg(date, "date")
     if return_date:
-        return_date = _parse_date(return_date, "return date")
+        return_date = _parse_date_arg(return_date, "return date")
 
     passengers = Passengers(adults=adults, children=children, infants_in_seat=0, infants_on_lap=0)
     pax = adults + children
@@ -190,6 +367,148 @@ def search(
                 raise typer.Exit(1)
 
         _print_results(inbound, destination, origin, return_date, seat, pax, max_stops, max_price, limit)
+
+
+@app.command()
+def weekends(
+    origin: str = typer.Argument(..., help="Origin airport IATA code (e.g. GRU)"),
+    destination: str = typer.Argument(..., help="Destination airport IATA code (e.g. MVD)"),
+    months: int = typer.Option(2, "--months", "-m", help="How many months ahead to search"),
+    seat: str = typer.Option("economy", "--seat", "-s", help="economy|business|first|premium-economy"),
+    adults: int = typer.Option(1, "--adults", "-a", help="Number of adults"),
+    children: int = typer.Option(0, "--children", "-c", help="Number of children"),
+    max_price: Optional[float] = typer.Option(None, "--max-price", "-p", help="Filter: max total round-trip price"),
+):
+    """Find and rank the cheapest weekends to visit a destination."""
+    from fast_flights import Passengers
+
+    origin = origin.upper()
+    destination = destination.upper()
+
+    today = date.today()
+    start = today + timedelta(days=1)
+    end = today + timedelta(days=months * 30)
+
+    holidays: dict = {}
+    for yr in {start.year, end.year}:
+        holidays.update(_brazilian_holidays(yr))
+
+    windows = _generate_weekend_windows(start, end, holidays)
+    if not windows:
+        console.print("[yellow]No weekends found in the specified range.[/yellow]")
+        raise typer.Exit(0)
+
+    # Collect unique (date_str, frm, to) searches
+    search_keys: dict = {}
+    for w in windows:
+        for dw in w.outbound_windows:
+            search_keys[(dw.d.strftime("%Y-%m-%d"), origin, destination)] = None
+        for dw in w.inbound_windows:
+            search_keys[(dw.d.strftime("%Y-%m-%d"), destination, origin)] = None
+
+    passengers = Passengers(adults=adults, children=children, infants_in_seat=0, infants_on_lap=0)
+    cache: dict = {}
+    sem = threading.Semaphore(3)
+
+    def _run(key):
+        date_str, frm, to = key
+        with sem:
+            try:
+                result = _search_one_way(frm, to, date_str, seat, passengers)
+            except Exception:
+                result = None
+        cache[key] = result
+
+    n_searches = len(search_keys)
+    console.print(
+        f"\nSearching [bold]{n_searches}[/bold] dates across "
+        f"[bold]{len(windows)}[/bold] weekends  ({origin} ↔ {destination})\n"
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Fetching flights…", total=n_searches)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(_run, k) for k in search_keys]
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+                progress.advance(task)
+
+    # Score each weekend
+    results: List[WeekendResult] = []
+    for w in windows:
+        best_out: Optional[BestFlight] = None
+        for dw in w.outbound_windows:
+            r = cache.get((dw.d.strftime("%Y-%m-%d"), origin, destination))
+            if not r:
+                continue
+            bf = _find_best_in_window(_dedupe(r.flights or []), dw)
+            if bf and (best_out is None or bf.price_num < best_out.price_num):
+                best_out = bf
+
+        best_in: Optional[BestFlight] = None
+        for dw in w.inbound_windows:
+            r = cache.get((dw.d.strftime("%Y-%m-%d"), destination, origin))
+            if not r:
+                continue
+            bf = _find_best_in_window(_dedupe(r.flights or []), dw)
+            if bf and (best_in is None or bf.price_num < best_in.price_num):
+                best_in = bf
+
+        results.append(WeekendResult(window=w, best_out=best_out, best_in=best_in))
+
+    # Filter and sort
+    if max_price is not None:
+        results = [r for r in results if r.total is not None and r.total <= max_price]
+
+    results.sort(key=lambda r: (r.total is None, r.total or 0))
+
+    if not results or all(r.total is None for r in results):
+        console.print("[yellow]No weekend options found. Try --months to search further ahead.[/yellow]")
+        raise typer.Exit(0)
+
+    pax = adults + children
+    table = Table(
+        title=f"[bold]{origin} ↔ {destination}[/bold]  ·  {seat.title()}  ·  {pax} pax  ·  Best weekends",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        show_lines=True,
+    )
+    table.add_column("Weekend", no_wrap=True)
+    table.add_column(f"Outbound ({origin}→{destination})", style="white")
+    table.add_column(f"Return ({destination}→{origin})", style="white")
+    table.add_column("Total", justify="right", style="bold green", no_wrap=True)
+
+    has_long = False
+    for wr in results:
+        if wr.total is None:
+            continue
+        if wr.window.is_long:
+            has_long = True
+
+        # Extract currency symbol for total
+        price_str = wr.best_out.price_str if wr.best_out else ""
+        currency = re.match(r"([^\d]+)", price_str).group(1) if price_str else ""
+        total_str = f"{currency}{wr.total:,.0f}"
+
+        table.add_row(
+            wr.window.label(),
+            wr.best_out.display() if wr.best_out else "—",
+            wr.best_in.display() if wr.best_in else "—",
+            total_str,
+        )
+
+    console.print()
+    console.print(table)
+    console.print()
+    if has_long:
+        console.print("  [dim]★ = long weekend due to Brazilian public holiday[/dim]\n")
 
 
 if __name__ == "__main__":
