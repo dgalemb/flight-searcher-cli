@@ -327,6 +327,60 @@ def _find_best_in_window(flights, dw: DateWindow, max_stops: Optional[int] = Non
     return best
 
 
+# ── Airport resolution ────────────────────────────────────────────────────────
+
+def _airports():
+    import airportsdata
+    return airportsdata.load("IATA")
+
+
+def _normalize(s: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower().strip()
+
+
+def _resolve_airport(query: str) -> str:
+    """Return a validated IATA code. Accepts a code directly or a city/airport name."""
+    db = _airports()
+
+    # Direct IATA code
+    if re.match(r"^[A-Za-z]{3}$", query):
+        code = query.upper()
+        if code in db:
+            return code
+
+    # City / name search
+    q = _normalize(query)
+
+    # Exact city match first, then partial fallback
+    matches = [(c, i) for c, i in db.items() if _normalize(i.get("city", "")) == q]
+    if not matches:
+        matches = [(c, i) for c, i in db.items()
+                   if q in _normalize(i.get("city", "")) or q in _normalize(i.get("name", ""))]
+
+    if not matches:
+        console.print(f"[red]No airports found for {query!r}. Try an IATA code (e.g. GRU).[/red]")
+        raise typer.Exit(1)
+
+    if len(matches) == 1:
+        code, info = matches[0]
+        console.print(f"  [dim]→ {code}  {info['name']} ({info['city']}, {info['country']})[/dim]")
+        return code
+
+    # Multiple results — show pick-list and exit
+    console.print(f"\n[yellow]Multiple airports found for {query!r}:[/yellow]\n")
+    for code, info in sorted(matches, key=lambda x: x[0])[:10]:
+        subd = f"{info['subd']}, " if info.get("subd") else ""
+        console.print(f"  [bold]{code}[/bold]  {info['name']}")
+        console.print(f"       {info['city']}, {subd}{info['country']}\n")
+    if len(matches) > 10:
+        console.print(f"  [dim]… and {len(matches) - 10} more[/dim]\n")
+    console.print("[dim]Re-run with the specific code, e.g.:[/dim]")
+    code_example = sorted(matches, key=lambda x: x[0])[0][0]
+    console.print(f"[dim]  flights search {code_example} ... [/dim]\n")
+    raise typer.Exit(0)
+
+
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 @app.command()
@@ -345,8 +399,8 @@ def search(
     """Search for flights on a specific date."""
     from fast_flights import Passengers
 
-    origin = origin.upper()
-    destination = destination.upper()
+    origin = _resolve_airport(origin)
+    destination = _resolve_airport(destination)
     date = _parse_date_arg(date, "date")
     if return_date:
         return_date = _parse_date_arg(return_date, "return date")
@@ -389,8 +443,8 @@ def weekends(
     import calendar
     from fast_flights import Passengers
 
-    origin = origin.upper()
-    destination = destination.upper()
+    origin = _resolve_airport(origin)
+    destination = _resolve_airport(destination)
 
     today = date.today()
 

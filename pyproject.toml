@@ -6,6 +6,7 @@ dependencies = [
     "fast-flights",
     "typer",
     "rich",
+    "airportsdata",
 ]
 
 [project.scripts]
