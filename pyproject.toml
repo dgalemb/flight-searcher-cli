@@ -1,0 +1,16 @@
+[project]
+name = "flight-searcher"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "fast-flights",
+    "typer",
+    "rich",
+]
+
+[project.scripts]
+flights = "flight_searcher:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
