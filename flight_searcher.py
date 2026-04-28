@@ -378,8 +378,7 @@ def search(
 def weekends(
     origin: str = typer.Argument(..., help="Origin airport IATA code (e.g. GRU)"),
     destination: str = typer.Argument(..., help="Destination airport IATA code (e.g. MVD)"),
-    from_month: Optional[int] = typer.Option(None, "--from-month", "-f", help="Start month (1-12). Defaults to next 2 months if omitted."),
-    to_month: Optional[int] = typer.Option(None, "--to-month", "-t", help="End month (1-12, inclusive). Defaults to from-month if omitted."),
+    months: Optional[str] = typer.Option(None, "--months", "-m", help="Month or range to search, e.g. 8 or 6-7. Defaults to next 2 months."),
     seat: str = typer.Option("economy", "--seat", "-s", help="economy|business|first|premium-economy"),
     adults: int = typer.Option(1, "--adults", "-a", help="Number of adults"),
     children: int = typer.Option(0, "--children", "-c", help="Number of children"),
@@ -395,18 +394,21 @@ def weekends(
 
     today = date.today()
 
-    if from_month is None and to_month is None:
+    if months is None:
         start = today + timedelta(days=1)
         end = today + timedelta(days=60)
     else:
-        fm = from_month or to_month
-        tm = to_month or from_month
+        parts = months.split("-")
+        try:
+            fm, tm = (int(parts[0]), int(parts[1])) if len(parts) == 2 else (int(parts[0]), int(parts[0]))
+        except ValueError:
+            console.print("[red]Invalid --months value. Use a month number (8) or range (6-7).[/red]")
+            raise typer.Exit(1)
 
         if not (1 <= fm <= 12 and 1 <= tm <= 12):
             console.print("[red]Months must be between 1 and 12.[/red]")
             raise typer.Exit(1)
 
-        # Resolve year for start month
         year = today.year
         if fm < today.month:
             year += 1
@@ -414,7 +416,6 @@ def weekends(
         if start <= today:
             start = today + timedelta(days=1)
 
-        # Resolve year for end month (may wrap to next year)
         to_year = year if tm >= fm else year + 1
         end = date(to_year, tm, calendar.monthrange(to_year, tm)[1])
 
