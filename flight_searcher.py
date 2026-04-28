@@ -339,45 +339,71 @@ def _normalize(s: str) -> str:
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode().lower().strip()
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import radians, sin, cos, sqrt, atan2
+    R = 6371
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+
+
+PROXIMITY_RADIUS_KM = 100
+
+
 def _resolve_airport(query: str) -> str:
     """Return a validated IATA code. Accepts a code directly or a city/airport name."""
     db = _airports()
 
-    # Direct IATA code
+    # Direct IATA code — fast path
     if re.match(r"^[A-Za-z]{3}$", query):
         code = query.upper()
         if code in db:
             return code
 
-    # City / name search
     q = _normalize(query)
 
-    # Exact city match first, then partial fallback
-    matches = [(c, i) for c, i in db.items() if _normalize(i.get("city", "")) == q]
-    if not matches:
-        matches = [(c, i) for c, i in db.items()
+    # Exact city name match → use their centroid for proximity search
+    exact = [(c, i) for c, i in db.items() if _normalize(i.get("city", "")) == q]
+
+    if exact:
+        ref_lat = sum(i["lat"] for _, i in exact) / len(exact)
+        ref_lon = sum(i["lon"] for _, i in exact) / len(exact)
+        matches = sorted(
+            [(c, i, _haversine_km(ref_lat, ref_lon, i["lat"], i["lon"]))
+             for c, i in db.items() if i.get("lat") and i.get("lon")],
+            key=lambda x: x[2],
+        )
+        matches = [(c, i, d) for c, i, d in matches if d <= PROXIMITY_RADIUS_KM]
+    else:
+        # Partial string fallback (no geo)
+        partial = [(c, i) for c, i in db.items()
                    if q in _normalize(i.get("city", "")) or q in _normalize(i.get("name", ""))]
+        if not partial:
+            console.print(f"[red]No airports found for {query!r}. Try an IATA code (e.g. GRU).[/red]")
+            raise typer.Exit(1)
+        matches = [(c, i, 0.0) for c, i in sorted(partial, key=lambda x: x[0])]
 
     if not matches:
         console.print(f"[red]No airports found for {query!r}. Try an IATA code (e.g. GRU).[/red]")
         raise typer.Exit(1)
 
     if len(matches) == 1:
-        code, info = matches[0]
+        code, info, dist = matches[0]
         console.print(f"  [dim]→ {code}  {info['name']} ({info['city']}, {info['country']})[/dim]")
         return code
 
-    # Multiple results — show pick-list and exit
-    console.print(f"\n[yellow]Multiple airports found for {query!r}:[/yellow]\n")
-    for code, info in sorted(matches, key=lambda x: x[0])[:10]:
+    # Multiple results — show pick-list sorted by distance and exit
+    console.print(f"\n[yellow]Airports within {PROXIMITY_RADIUS_KM} km of {query!r}:[/yellow]\n")
+    for code, info, dist in matches[:10]:
+        dist_str = f"  {dist:.0f} km" if dist > 0 else ""
         subd = f"{info['subd']}, " if info.get("subd") else ""
-        console.print(f"  [bold]{code}[/bold]  {info['name']}")
+        console.print(f"  [bold]{code}[/bold]  {info['name']}[dim]{dist_str}[/dim]")
         console.print(f"       {info['city']}, {subd}{info['country']}\n")
     if len(matches) > 10:
         console.print(f"  [dim]… and {len(matches) - 10} more[/dim]\n")
-    console.print("[dim]Re-run with the specific code, e.g.:[/dim]")
-    code_example = sorted(matches, key=lambda x: x[0])[0][0]
-    console.print(f"[dim]  flights search {code_example} ... [/dim]\n")
+    console.print("[dim]Re-run with the specific airport code, e.g.:[/dim]")
+    console.print(f"[dim]  flights search {matches[0][0]} ... [/dim]\n")
     raise typer.Exit(0)
 
 
