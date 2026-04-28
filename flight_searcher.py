@@ -226,12 +226,14 @@ class BestFlight:
     airline: str
     price_str: str
     price_num: float
+    stops: int = 0
 
     def display(self) -> str:
         m = re.match(r"(\d+:\d+)\s*([AP]M)", self.departure)
         time_str = f"{m.group(1)}{m.group(2)}" if m else "?"
         day = self.d.strftime("%a %-d %b")
-        return f"{day}  {time_str}\n{self.airline}  {self.price_str}"
+        stops_str = "Nonstop" if self.stops == 0 else f"{self.stops} stop{'s' if self.stops > 1 else ''}"
+        return f"{day}  {time_str}  {stops_str}\n{self.airline}  {self.price_str}"
 
 
 @dataclass
@@ -307,18 +309,21 @@ def _parse_flight_hour(departure_str: str) -> Optional[int]:
     return h
 
 
-def _find_best_in_window(flights, dw: DateWindow) -> Optional[BestFlight]:
+def _find_best_in_window(flights, dw: DateWindow, max_stops: Optional[int] = None) -> Optional[BestFlight]:
     best: Optional[BestFlight] = None
     for f in flights:
         hour = _parse_flight_hour(f.departure)
         if hour is None or not (dw.min_hour <= hour <= dw.max_hour):
+            continue
+        if max_stops is not None and _to_int_stops(f.stops) > max_stops:
             continue
         price = _parse_price(f.price)
         if price is None:
             continue
         if best is None or price < best.price_num:
             best = BestFlight(d=dw.d, departure=f.departure, airline=f.name,
-                              price_str=f.price, price_num=price)
+                              price_str=f.price, price_num=price,
+                              stops=_to_int_stops(f.stops))
     return best
 
 
@@ -373,21 +378,45 @@ def search(
 def weekends(
     origin: str = typer.Argument(..., help="Origin airport IATA code (e.g. GRU)"),
     destination: str = typer.Argument(..., help="Destination airport IATA code (e.g. MVD)"),
-    months: int = typer.Option(2, "--months", "-m", help="How many months ahead to search"),
+    from_month: Optional[int] = typer.Option(None, "--from-month", "-f", help="Start month (1-12). Defaults to next 2 months if omitted."),
+    to_month: Optional[int] = typer.Option(None, "--to-month", "-t", help="End month (1-12, inclusive). Defaults to from-month if omitted."),
     seat: str = typer.Option("economy", "--seat", "-s", help="economy|business|first|premium-economy"),
     adults: int = typer.Option(1, "--adults", "-a", help="Number of adults"),
     children: int = typer.Option(0, "--children", "-c", help="Number of children"),
+    max_stops: Optional[int] = typer.Option(None, "--max-stops", help="Filter: maximum number of stops per leg"),
     max_price: Optional[float] = typer.Option(None, "--max-price", "-p", help="Filter: max total round-trip price"),
 ):
     """Find and rank the cheapest weekends to visit a destination."""
+    import calendar
     from fast_flights import Passengers
 
     origin = origin.upper()
     destination = destination.upper()
 
     today = date.today()
-    start = today + timedelta(days=1)
-    end = today + timedelta(days=months * 30)
+
+    if from_month is None and to_month is None:
+        start = today + timedelta(days=1)
+        end = today + timedelta(days=60)
+    else:
+        fm = from_month or to_month
+        tm = to_month or from_month
+
+        if not (1 <= fm <= 12 and 1 <= tm <= 12):
+            console.print("[red]Months must be between 1 and 12.[/red]")
+            raise typer.Exit(1)
+
+        # Resolve year for start month
+        year = today.year
+        if fm < today.month:
+            year += 1
+        start = date(year, fm, 1)
+        if start <= today:
+            start = today + timedelta(days=1)
+
+        # Resolve year for end month (may wrap to next year)
+        to_year = year if tm >= fm else year + 1
+        end = date(to_year, tm, calendar.monthrange(to_year, tm)[1])
 
     holidays: dict = {}
     for yr in {start.year, end.year}:
@@ -448,7 +477,7 @@ def weekends(
             r = cache.get((dw.d.strftime("%Y-%m-%d"), origin, destination))
             if not r:
                 continue
-            bf = _find_best_in_window(_dedupe(r.flights or []), dw)
+            bf = _find_best_in_window(_dedupe(r.flights or []), dw, max_stops)
             if bf and (best_out is None or bf.price_num < best_out.price_num):
                 best_out = bf
 
@@ -457,7 +486,7 @@ def weekends(
             r = cache.get((dw.d.strftime("%Y-%m-%d"), destination, origin))
             if not r:
                 continue
-            bf = _find_best_in_window(_dedupe(r.flights or []), dw)
+            bf = _find_best_in_window(_dedupe(r.flights or []), dw, max_stops)
             if bf and (best_in is None or bf.price_num < best_in.price_num):
                 best_in = bf
 
@@ -470,7 +499,7 @@ def weekends(
     results.sort(key=lambda r: (r.total is None, r.total or 0))
 
     if not results or all(r.total is None for r in results):
-        console.print("[yellow]No weekend options found. Try --months to search further ahead.[/yellow]")
+        console.print("[yellow]No weekend options found. Try a different month range or relax --max-stops / --max-price.[/yellow]")
         raise typer.Exit(0)
 
     pax = adults + children
