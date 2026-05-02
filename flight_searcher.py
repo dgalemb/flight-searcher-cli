@@ -18,6 +18,78 @@ console = Console()
 
 PRICE_COLORS = {"low": "green", "typical": "yellow", "high": "red"}
 
+CURRENCY_SYMBOLS = {
+    "USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥",
+    "BRL": "R$", "ARS": "AR$", "UYU": "$U", "CAD": "CA$",
+    "AUD": "A$", "CHF": "CHF ", "CNY": "¥", "MXN": "MX$",
+}
+
+_fx_cache: dict = {}
+
+
+def _detect_currency(price_str: str) -> Optional[str]:
+    if not price_str:
+        return None
+    s = price_str.strip()
+    # Order matters — check multi-char prefixes first
+    for prefix, code in [("R$", "BRL"), ("AR$", "ARS"), ("CA$", "CAD"),
+                         ("A$", "AUD"), ("$U", "UYU"), ("MX$", "MXN"),
+                         ("US$", "USD")]:
+        if s.startswith(prefix):
+            return code
+    if s.startswith("$"): return "USD"
+    if s.startswith("€"): return "EUR"
+    if s.startswith("£"): return "GBP"
+    if s.startswith("¥"): return "JPY"
+    m = re.match(r"^([A-Z]{3})", s)
+    return m.group(1) if m else None
+
+
+def _get_fx_rate(from_cur: str, to_cur: str) -> Optional[float]:
+    if from_cur == to_cur:
+        return 1.0
+    key = (from_cur, to_cur)
+    if key in _fx_cache:
+        return _fx_cache[key]
+    try:
+        import urllib.request, json
+        url = f"https://api.frankfurter.dev/v1/latest?base={from_cur}&symbols={to_cur}"
+        req = urllib.request.Request(url, headers={"User-Agent": "flight-searcher/0.1"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            rate = json.loads(r.read())["rates"].get(to_cur)
+    except Exception:
+        rate = None
+    _fx_cache[key] = rate
+    return rate
+
+
+def _format_price(price_str: str, target: Optional[str], rate: Optional[float]) -> str:
+    if not price_str:
+        return "—"
+    if not target or not rate:
+        return price_str
+    num = _parse_price(price_str)
+    if num is None:
+        return price_str
+    converted = num * rate
+    symbol = CURRENCY_SYMBOLS.get(target, f"{target} ")
+    return f"{symbol}{converted:,.0f}"
+
+
+def _resolve_fx(flights, target_currency: Optional[str]) -> tuple:
+    """Detect source currency from first priced flight; return (target, rate) or (None, None)."""
+    if not target_currency:
+        return None, None
+    target = target_currency.upper()
+    src = next((_detect_currency(f.price) for f in flights if _detect_currency(f.price)), None)
+    if not src:
+        return None, None
+    rate = _get_fx_rate(src, target)
+    if rate is None:
+        console.print(f"[yellow]Warning: could not fetch {src}→{target} rate; showing original prices.[/yellow]")
+        return None, None
+    return target, rate
+
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
@@ -83,14 +155,20 @@ def _search_one_way(frm, to, date_str, seat, passengers):
         finally:
             sys.stderr = old_stderr
 
-    for attempt in range(3):
+    import time
+    last_exc = None
+    result = None
+    for attempt in range(5):
         try:
             result = _fetch()
-            if any(f.name for f in result.flights):
+            if result and any(f.name for f in result.flights):
                 return result
         except Exception as e:
-            if attempt == 2:
-                raise
+            last_exc = e
+        if attempt < 4:
+            time.sleep(0.5 * (attempt + 1))
+    if result is None and last_exc is not None:
+        raise last_exc
     return result
 
 
@@ -102,7 +180,7 @@ def _parse_date_arg(d: str, label: str) -> str:
         raise typer.Exit(1)
 
 
-def _print_results(result, frm, to, date_str, seat, pax, max_stops, max_price, limit):
+def _print_results(result, frm, to, date_str, seat, pax, max_stops, max_price, limit, target_currency=None):
     flights = _dedupe(result.flights or [])
     if not flights:
         console.print("[yellow]No flights found for this route/date.[/yellow]")
@@ -123,16 +201,16 @@ def _print_results(result, frm, to, date_str, seat, pax, max_stops, max_price, l
     remaining = len(flights) - limit
 
     display_date = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d-%m-%Y")
+    target, rate = _resolve_fx(flights, target_currency)
 
-    table = Table(
-        title=(
-            f"[bold]{frm} → {to}[/bold]  ·  {display_date}  ·  {seat.title()}  ·  {pax} pax"
-            f"  ·  {_price_sentiment(result.current_price)}"
-        ),
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        show_lines=False,
+    title = (
+        f"[bold]{frm} → {to}[/bold]  ·  {display_date}  ·  {seat.title()}  ·  {pax} pax"
+        f"  ·  {_price_sentiment(result.current_price)}"
     )
+    if target and rate:
+        title += f"  ·  [dim]prices in {target}[/dim]"
+
+    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan", show_lines=False)
     table.add_column("Airline")
     table.add_column("Departs", style="bold white")
     table.add_column("Arrives", style="white")
@@ -142,7 +220,8 @@ def _print_results(result, frm, to, date_str, seat, pax, max_stops, max_price, l
 
     for f in displayed:
         name = f"[bold]{f.name}[/bold]" if f.is_best else f.name
-        table.add_row(name, f.departure, f.arrival, f.duration, _fmt_stops(f.stops), f.price or "—")
+        table.add_row(name, f.departure, f.arrival, f.duration, _fmt_stops(f.stops),
+                      _format_price(f.price, target, rate))
 
     console.print()
     console.print(table)
@@ -228,12 +307,13 @@ class BestFlight:
     price_num: float
     stops: int = 0
 
-    def display(self) -> str:
+    def display(self, target: Optional[str] = None, rate: Optional[float] = None) -> str:
         m = re.match(r"(\d+:\d+)\s*([AP]M)", self.departure)
         time_str = f"{m.group(1)}{m.group(2)}" if m else "?"
         day = self.d.strftime("%a %-d %b")
         stops_str = "Nonstop" if self.stops == 0 else f"{self.stops} stop{'s' if self.stops > 1 else ''}"
-        return f"{day}  {time_str}  {stops_str}\n{self.airline}  {self.price_str}"
+        price = _format_price(self.price_str, target, rate)
+        return f"{day}  {time_str}  {stops_str}\n{self.airline}  {price}"
 
 
 @dataclass
@@ -420,6 +500,7 @@ def search(
     children: int = typer.Option(0, "--children", "-c", help="Number of children"),
     max_stops: Optional[int] = typer.Option(None, "--max-stops", help="Filter: maximum number of stops"),
     max_price: Optional[float] = typer.Option(None, "--max-price", "-p", help="Filter: maximum price (numeric, in displayed currency)"),
+    currency: Optional[str] = typer.Option(None, "--currency", help="Convert prices to this currency (e.g. USD, EUR)"),
     limit: int = typer.Option(20, "--limit", "-n", help="Max rows to display"),
 ):
     """Search for flights on a specific date."""
@@ -441,7 +522,7 @@ def search(
             console.print(f"[red]Error: {e}[/red]")
             raise typer.Exit(1)
 
-    _print_results(outbound, origin, destination, date, seat, pax, max_stops, max_price, limit)
+    _print_results(outbound, origin, destination, date, seat, pax, max_stops, max_price, limit, currency)
 
     if return_date:
         with console.status(f"Searching {destination} → {origin} on {return_date}…", spinner="dots"):
@@ -451,7 +532,7 @@ def search(
                 console.print(f"[red]Error: {e}[/red]")
                 raise typer.Exit(1)
 
-        _print_results(inbound, destination, origin, return_date, seat, pax, max_stops, max_price, limit)
+        _print_results(inbound, destination, origin, return_date, seat, pax, max_stops, max_price, limit, currency)
 
 
 @app.command()
@@ -464,6 +545,7 @@ def weekends(
     children: int = typer.Option(0, "--children", "-c", help="Number of children"),
     max_stops: Optional[int] = typer.Option(None, "--max-stops", help="Filter: maximum number of stops per leg"),
     max_price: Optional[float] = typer.Option(None, "--max-price", "-p", help="Filter: max total round-trip price"),
+    currency: Optional[str] = typer.Option(None, "--currency", help="Convert prices to this currency (e.g. USD, EUR)"),
 ):
     """Find and rank the cheapest weekends to visit a destination."""
     import calendar
@@ -583,13 +665,19 @@ def weekends(
         console.print("[yellow]No weekend options found. Try a different month range or relax --max-stops / --max-price.[/yellow]")
         raise typer.Exit(0)
 
-    pax = adults + children
-    table = Table(
-        title=f"[bold]{origin} ↔ {destination}[/bold]  ·  {seat.title()}  ·  {pax} pax  ·  Best weekends",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        show_lines=True,
+    # Resolve FX once across all priced flights
+    sample_flights = [bf for wr in results for bf in (wr.best_out, wr.best_in) if bf]
+    target, rate = _resolve_fx(
+        [type("F", (), {"price": bf.price_str})() for bf in sample_flights],
+        currency,
     )
+
+    pax = adults + children
+    title = f"[bold]{origin} ↔ {destination}[/bold]  ·  {seat.title()}  ·  {pax} pax  ·  Best weekends"
+    if target and rate:
+        title += f"  ·  [dim]prices in {target}[/dim]"
+
+    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan", show_lines=True)
     table.add_column("Weekend", no_wrap=True)
     table.add_column(f"Outbound ({origin}→{destination})", style="white")
     table.add_column(f"Return ({destination}→{origin})", style="white")
@@ -602,15 +690,19 @@ def weekends(
         if wr.window.is_long:
             has_long = True
 
-        # Extract currency symbol for total
-        price_str = wr.best_out.price_str if wr.best_out else ""
-        currency = re.match(r"([^\d]+)", price_str).group(1) if price_str else ""
-        total_str = f"{currency}{wr.total:,.0f}"
+        if target and rate:
+            converted_total = wr.total * rate
+            symbol = CURRENCY_SYMBOLS.get(target, f"{target} ")
+            total_str = f"{symbol}{converted_total:,.0f}"
+        else:
+            price_str = wr.best_out.price_str if wr.best_out else ""
+            symbol = re.match(r"([^\d]+)", price_str).group(1) if price_str else ""
+            total_str = f"{symbol}{wr.total:,.0f}"
 
         table.add_row(
             wr.window.label(),
-            wr.best_out.display() if wr.best_out else "—",
-            wr.best_in.display() if wr.best_in else "—",
+            wr.best_out.display(target, rate) if wr.best_out else "—",
+            wr.best_in.display(target, rate) if wr.best_in else "—",
             total_str,
         )
 
