@@ -335,16 +335,89 @@ class BestFlight:
 
 
 @dataclass
+class TripOption:
+    out: BestFlight
+    inb: BestFlight
+    total: float
+    duration_hours: float
+
+
+@dataclass
 class WeekendResult:
     window: WeekendWindow
-    best_out: Optional[BestFlight] = None
-    best_in: Optional[BestFlight] = None
+    options: List[TripOption]
 
     @property
     def total(self) -> Optional[float]:
-        if self.best_out and self.best_in:
-            return self.best_out.price_num + self.best_in.price_num
-        return None
+        return self.options[0].total if self.options else None
+
+
+def _trip_duration_hours(out: BestFlight, inb: BestFlight) -> float:
+    """Approx time at destination, using outbound dep → inbound dep."""
+    from datetime import time as _time
+    out_h = _parse_flight_hour(out.departure) or 0
+    in_h = _parse_flight_hour(inb.departure) or 0
+    out_dt = datetime.combine(out.d, _time(out_h))
+    in_dt = datetime.combine(inb.d, _time(in_h))
+    return (in_dt - out_dt).total_seconds() / 3600
+
+
+def _fmt_duration_h(hours: float) -> str:
+    days = int(hours // 24)
+    h = int(hours % 24)
+    return f"{days}d {h}h" if days > 0 else f"{h}h"
+
+
+def _pareto_options(window: WeekendWindow, cache: dict, origin: str, destination: str,
+                    max_stops: Optional[int]) -> List[TripOption]:
+    """Find Pareto-optimal (price, duration) trip combinations for a weekend."""
+    def best_per_window(windows, frm, to):
+        out = []
+        for dw in windows:
+            r = cache.get((dw.d.strftime("%Y-%m-%d"), frm, to))
+            if not r:
+                continue
+            bf = _find_best_in_window(_dedupe(r.flights or []), dw, max_stops)
+            if bf:
+                out.append(bf)
+        # Dedupe — multiple windows may pick the same flight
+        seen = set()
+        deduped = []
+        for f in out:
+            key = (f.d, f.departure, f.airline, f.price_str)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(f)
+        return deduped
+
+    outbounds = best_per_window(window.outbound_windows, origin, destination)
+    inbounds = best_per_window(window.inbound_windows, destination, origin)
+
+    options: List[TripOption] = []
+    for o in outbounds:
+        for i in inbounds:
+            if i.d < o.d:
+                continue
+            dur = _trip_duration_hours(o, i)
+            if dur <= 0:
+                continue
+            options.append(TripOption(out=o, inb=i, total=o.price_num + i.price_num, duration_hours=dur))
+
+    # Pareto: keep options not dominated by any other (cheaper-or-equal AND longer-or-equal, strictly better in one)
+    pareto: List[TripOption] = []
+    for opt in options:
+        dominated = any(
+            other is not opt
+            and other.total <= opt.total
+            and other.duration_hours >= opt.duration_hours
+            and (other.total < opt.total or other.duration_hours > opt.duration_hours)
+            for other in options
+        )
+        if not dominated:
+            pareto.append(opt)
+
+    pareto.sort(key=lambda o: o.total)
+    return pareto
 
 
 def _generate_weekend_windows(start: date, end: date, holidays: dict) -> List[WeekendWindow]:
@@ -564,6 +637,7 @@ def weekends(
     max_stops: Optional[int] = typer.Option(None, "--max-stops", help="Filter: maximum number of stops per leg"),
     max_price: Optional[float] = typer.Option(None, "--max-price", "-p", help="Filter: max total round-trip price"),
     currency: Optional[str] = typer.Option(None, "--currency", help="Convert prices to this currency (e.g. USD, EUR)"),
+    options: int = typer.Option(2, "--options", "-o", help="Max Pareto-optimal options to show per weekend (cheapest + more time at destination)"),
 ):
     """Find and rank the cheapest weekends to visit a destination."""
     import calendar
@@ -653,38 +727,23 @@ def weekends(
     # Score each weekend
     results: List[WeekendResult] = []
     for w in windows:
-        best_out: Optional[BestFlight] = None
-        for dw in w.outbound_windows:
-            r = cache.get((dw.d.strftime("%Y-%m-%d"), origin, destination))
-            if not r:
-                continue
-            bf = _find_best_in_window(_dedupe(r.flights or []), dw, max_stops)
-            if bf and (best_out is None or bf.price_num < best_out.price_num):
-                best_out = bf
+        opts = _pareto_options(w, cache, origin, destination, max_stops)
+        results.append(WeekendResult(window=w, options=opts))
 
-        best_in: Optional[BestFlight] = None
-        for dw in w.inbound_windows:
-            r = cache.get((dw.d.strftime("%Y-%m-%d"), destination, origin))
-            if not r:
-                continue
-            bf = _find_best_in_window(_dedupe(r.flights or []), dw, max_stops)
-            if bf and (best_in is None or bf.price_num < best_in.price_num):
-                best_in = bf
-
-        results.append(WeekendResult(window=w, best_out=best_out, best_in=best_in))
-
-    # Filter and sort
+    # Filter by max total price (applied to each option)
     if max_price is not None:
-        results = [r for r in results if r.total is not None and r.total <= max_price]
+        for r in results:
+            r.options = [o for o in r.options if o.total <= max_price]
 
-    results.sort(key=lambda r: (r.total is None, r.total or 0))
+    results = [r for r in results if r.options]
+    results.sort(key=lambda r: r.total or 0)
 
-    if not results or all(r.total is None for r in results):
+    if not results:
         console.print("[yellow]No weekend options found. Try a different month range or relax --max-stops / --max-price.[/yellow]")
         raise typer.Exit(0)
 
     # Resolve FX once across all priced flights
-    sample_flights = [bf for wr in results for bf in (wr.best_out, wr.best_in) if bf]
+    sample_flights = [bf for wr in results for opt in wr.options for bf in (opt.out, opt.inb)]
     target, rate = _resolve_fx(
         [type("F", (), {"price": bf.price_str})() for bf in sample_flights],
         currency,
@@ -695,34 +754,38 @@ def weekends(
     if target and rate:
         title += f"  ·  [dim]prices in {target}[/dim]"
 
-    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan", show_lines=True)
+    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan", show_lines=False)
     table.add_column("Weekend", no_wrap=True)
     table.add_column(f"Outbound ({origin}→{destination})", style="white")
     table.add_column(f"Return ({destination}→{origin})", style="white")
+    table.add_column("At dest", justify="right", style="dim", no_wrap=True)
     table.add_column("Total", justify="right", style="bold green", no_wrap=True)
 
     has_long = False
-    for wr in results:
-        if wr.total is None:
-            continue
+    for wr_idx, wr in enumerate(results):
         if wr.window.is_long:
             has_long = True
 
-        if target and rate:
-            converted_total = wr.total * rate
-            symbol = CURRENCY_SYMBOLS.get(target, f"{target} ")
-            total_str = f"{symbol}{converted_total:,.0f}"
-        else:
-            price_str = wr.best_out.price_str if wr.best_out else ""
-            symbol = re.match(r"([^\d]+)", price_str).group(1) if price_str else ""
-            total_str = f"{symbol}{wr.total:,.0f}"
+        if wr_idx > 0:
+            table.add_section()
 
-        table.add_row(
-            wr.window.label(),
-            wr.best_out.display(target, rate) if wr.best_out else "—",
-            wr.best_in.display(target, rate) if wr.best_in else "—",
-            total_str,
-        )
+        for opt_idx, opt in enumerate(wr.options[:options]):
+            if target and rate:
+                symbol = CURRENCY_SYMBOLS.get(target, f"{target} ")
+                total_str = f"{symbol}{opt.total * rate:,.0f}"
+            else:
+                price_str = opt.out.price_str
+                symbol = re.match(r"([^\d]+)", price_str).group(1) if price_str else ""
+                total_str = f"{symbol}{opt.total:,.0f}"
+
+            label = wr.window.label() if opt_idx == 0 else ""
+            table.add_row(
+                label,
+                opt.out.display(target, rate),
+                opt.inb.display(target, rate),
+                _fmt_duration_h(opt.duration_hours),
+                total_str,
+            )
 
     console.print()
     console.print(table)
