@@ -51,14 +51,32 @@ def _get_fx_rate(from_cur: str, to_cur: str) -> Optional[float]:
     key = (from_cur, to_cur)
     if key in _fx_cache:
         return _fx_cache[key]
+
+    import urllib.request, json
+    rate: Optional[float] = None
+
+    # Primary: fawazahmed0/currency-api (no key, supports ~200 currencies including UYU)
     try:
-        import urllib.request, json
-        url = f"https://api.frankfurter.dev/v1/latest?base={from_cur}&symbols={to_cur}"
-        req = urllib.request.Request(url, headers={"User-Agent": "flight-searcher/0.1"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            rate = json.loads(r.read())["rates"].get(to_cur)
+        url = (
+            f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest"
+            f"/v1/currencies/{from_cur.lower()}.json"
+        )
+        with urllib.request.urlopen(url, timeout=5) as r:
+            data = json.loads(r.read())
+            rate = data.get(from_cur.lower(), {}).get(to_cur.lower())
     except Exception:
-        rate = None
+        pass
+
+    # Fallback: Frankfurter (ECB-backed, ~30 majors)
+    if rate is None:
+        try:
+            url = f"https://api.frankfurter.dev/v1/latest?base={from_cur}&symbols={to_cur}"
+            req = urllib.request.Request(url, headers={"User-Agent": "flight-searcher/0.1"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                rate = json.loads(r.read())["rates"].get(to_cur)
+        except Exception:
+            rate = None
+
     _fx_cache[key] = rate
     return rate
 
